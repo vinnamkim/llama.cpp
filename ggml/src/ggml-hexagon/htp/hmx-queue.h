@@ -48,6 +48,7 @@ struct hmx_queue_s {
     uint32_t         capacity;
 
     atomic_uint      seqn;      // incremented for all pushes, used with futex
+    atomic_bool      sleeping;  // thread is in futex_wait (needs a wake), else it polls seqn
     qurt_thread_t    thread;
     void *           stack;
     uint32_t         hap_rctx;
@@ -83,9 +84,11 @@ static inline bool hmx_queue_push(hmx_queue_t q, struct hmx_queue_desc d) {
 
     q->desc[iw] = d;
     atomic_store(&q->idx_write, (iw + 1) & q->idx_mask);
-    // wake up our thread
+    // wake up our thread (only a syscall when it sleeps; a polling thread sees seqn change)
     atomic_fetch_add(&q->seqn, 1);
-    qurt_futex_wake(&q->seqn, 1);
+    if (atomic_load(&q->sleeping)) {
+        qurt_futex_wake(&q->seqn, 1);
+    }
 
     return true;
 }

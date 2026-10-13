@@ -24,6 +24,7 @@
 #include "htp-tensor.h"
 #include "matmul-ops.h"
 #include "htp-vtcm.h"
+#include "hmx-mm-cpp.h"
 
 typedef struct {
     float        *dst;
@@ -3919,6 +3920,10 @@ static int op_matmul_impl(struct htp_ops_context * octx) {
     const int status = htp_mm_init_context(octx, kparams);
     if (status != HTP_STATUS_OK) {
         return status;
+    }
+
+    if (kparams->kernel_type == HTP_MM_KERNEL_HMX_Q4_0_CPP) {
+        return op_matmul_hmx_cpp(octx);
     }
 
     if (kparams->n_hmx) {

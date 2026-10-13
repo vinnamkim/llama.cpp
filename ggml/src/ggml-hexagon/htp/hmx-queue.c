@@ -78,7 +78,11 @@ static void hmx_queue_thread(void * arg) {
             }
             if (--poll_cnt) { hex_pause(); continue; }
             FARF(HIGH, "hmx-queue-thread: sleeping");
+            // a push that lands after this store sees sleeping and wakes us; one that landed before changed seqn,
+            // so futex_wait returns at once
+            atomic_store(&q->sleeping, true);
             qurt_futex_wait(&q->seqn, prev_seqn);
+            atomic_store(&q->sleeping, false);
             poll_cnt = HMX_QUEUE_POLL_COUNT;
             continue;
         }

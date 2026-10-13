@@ -83,6 +83,9 @@ enum htp_mm_kernel_type {
     // HVX quantized paths
     HTP_MM_KERNEL_HVX_QUANT_ROW,      // standard row-wise parallel quantization
     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
+
+    // C++ HMX pipeline (hmx-mm-pipeline.h), Q4_0 x F32 only
+    HTP_MM_KERNEL_HMX_Q4_0_CPP,
 };
 
 // Op-specific struct for precomputed matmul params
@@ -116,6 +119,14 @@ struct htp_mm_kernel_params {
     struct fastdiv_values div_ne12;
     struct fastdiv_values div_n_act_threads;
     struct fastdiv_values div_ne00_padded;
+
+    // HTP_MM_KERNEL_HMX_Q4_0_CPP only (pipeline = hmx_mm::sched_kind, n_prefetch = weight DMA depth)
+    uint8_t  n_act_bufs;         // fp16 activation buffers in VTCM
+    uint8_t  act_dma_rows;       // rows per activation DMA step
+    uint8_t  act_dma_threads;    // threads converting activations through DMA staging
+    uint8_t  ramp;               // ramp up the first weight chunks
+    uint8_t  engine;             // 0 = fork-join steps, 1 = dataflow
+    uint8_t  pad_cpp;
 };
 
 #if defined(__cplusplus)

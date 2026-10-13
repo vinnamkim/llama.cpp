@@ -61,6 +61,7 @@
 #include "htp-opnode.h"
 #include "htp-ops.h"
 #include "htp/matmul-ops.h"
+#include "htp/hmx-mm-plan.h"
 #include "htp/binary-ops.h"
 #include "htp/flash-attn-ops.h"
 #include "htp/unary-ops.h"
@@ -114,6 +115,8 @@ static size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/
 static size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
 
 static int    opt_mm_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+static int    opt_mm_cpp     = 0; // C++ HMX pipeline for Q4_0 x F32: 0 = off, 1 = all M, 2 = only M > HTP_MM_HMX_MIN_NROWS
+static int    opt_mm_cpp_engine = 1; // C++ HMX pipeline engine: 0 = fork-join steps, 1 = dataflow
 static int    opt_fa_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_head_split = 1; // 1 = partition flash_attn by KV heads in multicore (default on), 0 = token-based (original)
 static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
@@ -565,6 +568,7 @@ struct ggml_hexagon_session {
     std::vector<htp_opnode> cached_nodes;
 
     mutable std::unordered_set<const ggml_tensor *> needs_repack;
+    mutable std::unordered_map<uint64_t, hmx_mm::plan> hmx_cpp_plans;  // planner results by (m, k, n), see ggml_hexagon_precompute_hmx_cpp_mm_params
 
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
@@ -3631,6 +3635,9 @@ struct ggml_hexagon_opbatch {
         if (src2->type != GGML_TYPE_F32) return false;
 
         const struct htp_mm_kernel_params * orig_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
+        if (orig_kparams->kernel_type == HTP_MM_KERNEL_HMX_Q4_0_CPP) {
+            return false;  // the C++ pipeline has no fused bias
+        }
         struct htp_mm_kernel_params kparams;
         ggml_hexagon_precompute_fused_matmul_add_params(sess, src0, src1, src2, node.dst(), &kparams);
         if (kparams.kernel_type == HTP_MM_KERNEL_UNSUPPORTED) {
@@ -3790,6 +3797,9 @@ struct ggml_hexagon_opbatch {
             const ggml_tensor * dst_1 = node.dst();
 
             const struct htp_mm_kernel_params * orig_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
+            if (orig_kparams->kernel_type == HTP_MM_KERNEL_HMX_Q4_0_CPP) {
+                return false;  // keep the C++ pipeline nodes unfused (no NX support yet)
+            }
             const bool collapse = orig_kparams->collapse && ggml_hexagon_matmul_can_collapse(w1, x, dst_1);
             if (orig_kparams->collapse && !collapse) {
                 return false;
@@ -5703,6 +5713,72 @@ static void ggml_hexagon_precompute_hvx_mm_params(
     }
 }
 
+// C++ HMX pipeline (htp/hmx-mm-pipeline.h): flat 2D Q4_0 x F32 -> F32 without bias
+static bool ggml_hexagon_precompute_hmx_cpp_mm_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * dst,
+    int ne00,
+    int ne01_tiled,
+    int ne11,
+    size_t vtcm_budget,
+    struct htp_mm_kernel_params * kparams
+) {
+    if (ne00 % 32 != 0 || src1->ne[0] != ne00) {
+        return false;
+    }
+    if (src0->nb[0] > src0->nb[1] || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (opt_mm_cpp == 2 && ne11 <= HTP_MM_HMX_MIN_NROWS) {
+        return false;
+    }
+
+    const hmx_mm::shape  s   = { (uint32_t) ne11, (uint32_t) ne00, (uint32_t) ne01_tiled };
+    const hmx_mm::limits lim = { (uint32_t) sess->n_threads, vtcm_budget };
+    hmx_mm::plan pl;
+    // the search costs tens of us and runs for every node on every graph build: cache it per shape
+    const uint64_t key = ((uint64_t) (uint32_t) ne11 << 40) ^ ((uint64_t) (uint32_t) ne00 << 20) ^ (uint64_t) (uint32_t) ne01_tiled ^
+                         ((uint64_t) opt_mm_cpp_engine << 62);
+    auto it = sess->hmx_cpp_plans.find(key);
+    if (it != sess->hmx_cpp_plans.end()) {
+        pl = it->second;
+    } else {
+        if (!hmx_mm::make_plan(s, lim, hmx_mm::formats::q4_0_f32_f16, (uint32_t) opt_mm_cpp_engine, &pl)) {
+            return false;
+        }
+        if (sess->hmx_cpp_plans.size() > 4096) {
+            sess->hmx_cpp_plans.clear();
+        }
+        sess->hmx_cpp_plans[key] = pl;
+    }
+
+    kparams->kernel_type       = HTP_MM_KERNEL_HMX_Q4_0_CPP;
+    kparams->n_hmx             = 1;
+    kparams->pipeline          = (uint8_t) pl.kind;
+    kparams->n_threads         = (uint8_t) pl.n_threads;
+    kparams->n_act_threads     = (uint8_t) pl.n_threads;  // satisfies htp_mm_init_context, unused by the C++ kernel
+    kparams->n_prefetch        = (uint8_t) pl.n_raw_bufs;
+    kparams->n_act_bufs        = (uint8_t) pl.n_a_bufs;
+    kparams->act_dma_rows      = (uint8_t) pl.act_rows_per_dma;
+    kparams->act_dma_threads   = (uint8_t) pl.act_threads;
+    kparams->ramp              = (uint8_t) pl.ramp;
+    kparams->engine            = (uint8_t) pl.engine;
+    kparams->m_chunk           = (int32_t) pl.mc;
+    kparams->n_chunk           = (int32_t) pl.nc;
+    kparams->tile_size         = HTP_MM_WEIGHT_TILE_SIZE_Q4_0;
+    kparams->aligned_tile_size = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
+    kparams->vtcm_size         = (int32_t) pl.vtcm_bytes;
+    kparams->div_n_act_threads = init_fastdiv_values(pl.n_threads);
+    kparams->div_ne00_padded   = init_fastdiv_values(ne00);
+
+    HEX_VERBOSE("ggml-hex: %s hmx-cpp plan: m %d k %d n %d -> %s eng %u mc %u nc %u ramp %u raw %u abuf %u act-th %u/%u vtcm %zu\n",
+                sess->c_name(), ne11, ne00, ne01_tiled, pl.kind == hmx_mm::sched_kind::decode ? "decode" : "prefill",
+                pl.engine, pl.mc, pl.nc, pl.ramp, pl.n_raw_bufs, pl.n_a_bufs, pl.act_threads, pl.act_rows_per_dma, pl.vtcm_bytes);
+    return true;
+}
+
 static void ggml_hexagon_precompute_matmul_params_impl(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,
@@ -5740,6 +5816,11 @@ static void ggml_hexagon_precompute_matmul_params_impl(
 
     // Check HMX eligibility and try precomputing HMX parameters
     bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2);
+    if (hmx_enabled && opt_mm_cpp > 0 && wtype == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32 &&
+        !is_matmul_id && !is_batched && src2_size == 0 && sess->mdev.count == 1 &&
+        ggml_hexagon_precompute_hmx_cpp_mm_params(sess, src0, src1, dst, ne00, ne01_tiled, ne11, vtcm_budget, kparams)) {
+        goto finalize;
+    }
     if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
         if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, src2_size, vtcm_budget, kparams)) {
             goto finalize;
@@ -9889,6 +9970,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_nhvx     = getenv("GGML_HEXAGON_NHVX");
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
+    const char * str_mm_cpp   = getenv("GGML_HEXAGON_MM_CPP");
+    const char * str_mm_cpp_engine = getenv("GGML_HEXAGON_MM_CPP_ENGINE");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_head_split = getenv("GGML_HEXAGON_FA_HEAD_SPLIT");
     const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
@@ -9944,6 +10027,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
+    opt_mm_cpp    = str_mm_cpp    ? atoi(str_mm_cpp)                      : opt_mm_cpp;
+    opt_mm_cpp_engine = str_mm_cpp_engine ? atoi(str_mm_cpp_engine)       : opt_mm_cpp_engine;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_head_split = str_fa_head_split ? atoi(str_fa_head_split)       : opt_fa_head_split;
     opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
