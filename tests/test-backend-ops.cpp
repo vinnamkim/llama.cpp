@@ -10692,6 +10692,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    // larger token counts for the Hexagon HMX prefill pipeline (local test, not for upstream)
+    for (int64_t n : {33, 64, 100, 128, 256, 512}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{2880, 2880}, {100, 96}, {1000, 5120}, {64, 256}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
@@ -11975,6 +11981,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Llama-3.2-1B Q4_0 projection shapes for the Hexagon HMX pipeline (local test, not for upstream)
+    for (int64_t n : {1, 4, 128, 512}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{2048, 2048}, {512, 2048}, {8192, 2048}, {2048, 8192}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
