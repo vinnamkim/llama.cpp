@@ -330,6 +330,11 @@ on 4 physical NPUs, or `--devices 'HTP0[0-1:0],HTP1[0-1:1]'` on 2 physical NPUs 
 - `GGML_HEXAGON_DMA64=0` (default: enabled on v81+)
   Disables 64-bit DMA for model weights. Set to `1` to enable it explicitly on a supported architecture.
 
+- `GGML_HEXAGON_MM_CPP=0` (default: 0, disabled)
+  Selects the composable C++ HMX matmul pipeline for Q4_0 x F32 matmuls: `1` for every M, `2` only for M > 4.
+  `GGML_HEXAGON_MM_CPP_ENGINE=0` switches it from the dataflow engine to the fork-join engine.
+  See the [HMX C++ matmul pipeline guide](hmx-mm-cpp.md).
+
 - `GGML_HEXAGON_VERBOSE=1`
   Enables verbose logging of Ops from the backend. Example output:
 
